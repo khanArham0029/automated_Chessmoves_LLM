@@ -1,0 +1,133 @@
+import cv2
+import mss
+import numpy as np
+from ultralytics import YOLO
+from fen_tracker import FENTracker
+
+# Load the trained YOLO model
+model = YOLO(r"C:\Users\ASDF\Documents\Personnel\chessWinner\other_models\bestKaggle.pt")
+
+# Screen capture parameters
+monitor = {"top": 155, "left": 170, "width": 650, "height": 610}
+
+# Configuration
+CONFIDENCE_THRESHOLD = 0.92
+IOU_THRESHOLD = 0.45
+FRAME_SKIP = 2  # Process every 3rd frame to reduce CPU load
+
+piece_Fen_map = {
+    'B': 'B', 'K': 'K', 'N': 'N', 'P': 'P', 'Q': 'Q', 'R': 'R',
+    'b': 'b', 'k': 'k', 'n': 'n', 'p': 'p', 'q': 'q', 'r': 'r'
+}
+
+class ChessDetector:
+    def __init__(self):
+        self.frame_count = 0
+        self.sct = mss.mss()
+        self.square_cache = None
+        self.previous_fen = "8/8/8/8/8/8/8/8 w KQkq - 0 1"
+
+    def get_fen_from_detections(self, results):
+        if not results or not results[0].boxes:
+            return self.previous_fen
+
+        board = [[{'piece': '', 'conf': 0} for _ in range(8)] for _ in range(8)]
+        img_w, img_h = monitor['width'], monitor['height']
+        square_w, square_h = img_w/8, img_h/8
+
+        for result in results:
+            for box in result.boxes:
+                x1, y1, x2, y2 = map(int, box.xyxy[0])
+                conf = float(box.conf[0])
+                cls_idx = int(box.cls[0])
+                class_name = model.names[cls_idx]
+
+                if class_name not in piece_Fen_map:
+                    continue
+
+                # Calculate center position
+                center_x = (x1 + x2) / 2
+                center_y = (y1 + y2) / 2
+                col = min(7, int(center_x // square_w))
+                row = min(7, int(center_y // square_h))
+
+                # Track highest confidence piece per square
+                if conf > board[row][col]['conf']:
+                    board[row][col] = {
+                        'piece': piece_Fen_map[class_name],
+                        'conf': conf
+                    }
+
+        # Build FEN string
+        fen_rows = []
+        for r_idx, row in enumerate(board):
+            fen_row = []
+            empty_count = 0
+            
+            for c_idx, square in enumerate(row):
+                if square['piece']:
+                    if empty_count > 0:
+                        fen_row.append(str(empty_count))
+                        empty_count = 0
+                    fen_row.append(square['piece'])
+                else:
+                    empty_count += 1
+                    
+            if empty_count > 0:
+                fen_row.append(str(empty_count))
+            fen_rows.append(''.join(fen_row))
+
+        fen = "/".join(fen_rows) + " w KQkq - 0 1"
+        self.previous_fen = fen
+        return fen
+
+    def run(self):
+        try:
+            while True:
+                self.frame_count += 1
+                if self.frame_count % FRAME_SKIP != 0:
+                    continue
+
+                # Capture screen
+                screenshot = self.sct.grab(monitor)
+                img = cv2.cvtColor(np.array(screenshot), cv2.COLOR_BGRA2BGR)
+                
+                # Run inference with optimized parameters
+                results = model(img, conf=CONFIDENCE_THRESHOLD, iou=IOU_THRESHOLD)
+                
+                # Generate FEN
+                fen = self.get_fen_from_detections(results)
+                print(f"FEN: {fen}")
+
+                # Visualization
+                display_img = img.copy()
+                for result in results:
+                    for box in result.boxes:
+                        x1, y1, x2, y2 = map(int, box.xyxy[0])
+                        cls_idx = int(box.cls[0])
+                        class_name = model.names[cls_idx]
+                        
+                        # Color coding: blue for white, red for black
+                        color = (255, 0, 0) if class_name.isupper() else (0, 0, 255)
+                        cv2.rectangle(display_img, (x1, y1), (x2, y2), color, 2)
+                        label = f"{class_name} {float(box.conf[0]):.2f}"
+                        cv2.putText(display_img, label, (x1, y1-5),
+                                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+
+                # Display FEN (wrapped for better visibility)
+                y_start = 30
+                for i, part in enumerate(fen.split(' ')[0].split('/')):
+                    cv2.putText(display_img, part, (10, y_start + i*20),
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+
+                cv2.imshow("Chess Detection", display_img)
+                if cv2.waitKey(1) & 0xFF == ord("q"):
+                    break
+
+        finally:
+            cv2.destroyAllWindows()
+            self.sct.close()
+
+if __name__ == "__main__":
+    detector = ChessDetector()
+    detector.run()
