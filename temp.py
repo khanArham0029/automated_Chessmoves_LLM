@@ -1,127 +1,150 @@
 import cv2
 import mss
+import os
+import time
 import numpy as np
+import pyttsx3
+import chess
+import chess.pgn
 from ultralytics import YOLO
-from fen_tracker import FENTracker
+import google.generativeai as genai
+
+# Configure Gemini API
+genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
 
 # Load the trained YOLO model
 model = YOLO(r"C:\Users\ASDF\Documents\Personnel\chessWinner\other_models\bestKaggle.pt")
+
+# Load the fine-tuned Gemini model
+gemini_model = genai.GenerativeModel("tunedModels/chess-tactics-7133")
 
 # Screen capture parameters
 monitor = {"top": 155, "left": 170, "width": 650, "height": 610}
 
 # Configuration
-CONFIDENCE_THRESHOLD = 0.92
+CONFIDENCE_THRESHOLD = 0.95
 IOU_THRESHOLD = 0.45
-FRAME_SKIP = 2  # Process every 3rd frame to reduce CPU load
+DEBOUNCE_DELAY = 2
+COOLDOWN_DELAY = 5
 
-piece_Fen_map = {
-    'B': 'B', 'K': 'K', 'N': 'N', 'P': 'P', 'Q': 'Q', 'R': 'R',
-    'b': 'b', 'k': 'k', 'n': 'n', 'p': 'p', 'q': 'q', 'r': 'r'
-}
+# Piece names mapping
+piece_names = {'K': "King", 'Q': "Queen", 'R': "Rook", 'B': "Bishop", 'N': "Knight", 'P': "Pawn"}
 
 class ChessDetector:
     def __init__(self):
-        self.frame_count = 0
         self.sct = mss.mss()
-        self.square_cache = None
         self.previous_fen = "8/8/8/8/8/8/8/8 w KQkq - 0 1"
+        self.last_api_call = 0
+        self.current_move = ""
+        self.detect_now = False
+        self.detection_start_time = None
 
-    def get_fen_from_detections(self, results):
-        if not results or not results[0].boxes:
-            return self.previous_fen
+        # Initialize text-to-speech engine
+        self.tts_engine = pyttsx3.init()
+        self.tts_engine.setProperty('rate', 160)  # Adjust speed (default ~200)
+        self.tts_engine.setProperty('volume', 1.0)  # Set volume (0.0 to 1.0)
 
-        board = [[{'piece': '', 'conf': 0} for _ in range(8)] for _ in range(8)]
-        img_w, img_h = monitor['width'], monitor['height']
-        square_w, square_h = img_w/8, img_h/8
+    def speak_move(self, move_text):
+        """Convert text to speech"""
+        print(f"Speaking: {move_text}")
+        self.tts_engine.say(move_text)
+        self.tts_engine.runAndWait()
 
-        for result in results:
-            for box in result.boxes:
-                x1, y1, x2, y2 = map(int, box.xyxy[0])
-                conf = float(box.conf[0])
-                cls_idx = int(box.cls[0])
-                class_name = model.names[cls_idx]
+    def get_optimal_move(self, fen_position):
+        """Query Gemini model for optimal move and speak it aloud"""
+        try:
+            prompt = f"Given the chess position {fen_position}, what is the optimal next move? Respond only with the move in standard chess notation."
+            response = gemini_model.generate_content(prompt)
+            move = response.text.strip()
 
-                if class_name not in piece_Fen_map:
-                    continue
+            # Convert to human-readable text
+            move_text = self.translate_move_to_text(fen_position, move)
+            self.speak_move(move_text)  # Speak the move aloud
+            return move_text
+        except Exception as e:
+            print(f"Error getting move from Gemini: {e}")
+            return ""
 
-                # Calculate center position
-                center_x = (x1 + x2) / 2
-                center_y = (y1 + y2) / 2
-                col = min(7, int(center_x // square_w))
-                row = min(7, int(center_y // square_h))
+    def translate_move_to_text(self, fen, move):
+        """Convert UCI move (e2e4) to human-readable format."""
+        try:
+            board = chess.Board(fen)
+            uci_move = chess.Move.from_uci(move)
 
-                # Track highest confidence piece per square
-                if conf > board[row][col]['conf']:
-                    board[row][col] = {
-                        'piece': piece_Fen_map[class_name],
-                        'conf': conf
-                    }
+            if uci_move not in board.legal_moves:
+                print(f"Received move from Gemini: {move}")
+                return f"Invalid move: {move}"
 
-        # Build FEN string
-        fen_rows = []
-        for r_idx, row in enumerate(board):
-            fen_row = []
-            empty_count = 0
-            
-            for c_idx, square in enumerate(row):
-                if square['piece']:
-                    if empty_count > 0:
-                        fen_row.append(str(empty_count))
-                        empty_count = 0
-                    fen_row.append(square['piece'])
-                else:
-                    empty_count += 1
-                    
-            if empty_count > 0:
-                fen_row.append(str(empty_count))
-            fen_rows.append(''.join(fen_row))
+            board.push(uci_move)  # Apply move to board
 
-        fen = "/".join(fen_rows) + " w KQkq - 0 1"
-        self.previous_fen = fen
-        return fen
+            piece = board.piece_at(uci_move.to_square)
+            piece_name = piece_names.get(piece.symbol().upper(), "Piece")
+            move_text = f"Move {piece_name} to {chess.square_name(uci_move.to_square)}"
+
+            return move_text
+        except Exception as e:
+            print(f"Received move from Gemini: {move}")
+            return f"Error translating move: {move}"
 
     def run(self):
         try:
             while True:
-                self.frame_count += 1
-                if self.frame_count % FRAME_SKIP != 0:
-                    continue
-
-                # Capture screen
                 screenshot = self.sct.grab(monitor)
                 img = cv2.cvtColor(np.array(screenshot), cv2.COLOR_BGRA2BGR)
-                
-                # Run inference with optimized parameters
-                results = model(img, conf=CONFIDENCE_THRESHOLD, iou=IOU_THRESHOLD)
-                
-                # Generate FEN
-                fen = self.get_fen_from_detections(results)
-                print(f"FEN: {fen}")
 
-                # Visualization
-                display_img = img.copy()
-                for result in results:
-                    for box in result.boxes:
-                        x1, y1, x2, y2 = map(int, box.xyxy[0])
-                        cls_idx = int(box.cls[0])
-                        class_name = model.names[cls_idx]
-                        
-                        # Color coding: blue for white, red for black
-                        color = (255, 0, 0) if class_name.isupper() else (0, 0, 255)
-                        cv2.rectangle(display_img, (x1, y1), (x2, y2), color, 2)
-                        label = f"{class_name} {float(box.conf[0]):.2f}"
-                        cv2.putText(display_img, label, (x1, y1-5),
-                                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+                cv2.putText(img, "Press 'D' to Detect Now", (10, 30),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
 
-                # Display FEN (wrapped for better visibility)
-                y_start = 30
-                for i, part in enumerate(fen.split(' ')[0].split('/')):
-                    cv2.putText(display_img, part, (10, y_start + i*20),
-                               cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+                if self.detect_now:
+                    if self.detection_start_time is None:
+                        self.detection_start_time = time.time()
 
-                cv2.imshow("Chess Detection", display_img)
-                if cv2.waitKey(1) & 0xFF == ord("q"):
+                    elapsed_time = time.time() - self.detection_start_time
+                    if elapsed_time > 1:
+                        self.detect_now = False
+                        self.detection_start_time = None
+                    else:
+                        # Perform YOLO detection
+                        results = model(img, conf=CONFIDENCE_THRESHOLD, iou=IOU_THRESHOLD)
+
+                        for result in results:
+                            for box in result.boxes:
+                                x1, y1, x2, y2 = map(int, box.xyxy[0])  # Get box coordinates
+                                conf = float(box.conf[0])  # Confidence score
+                                cls_idx = int(box.cls[0])  # Class index
+                                class_name = model.names[cls_idx]  # Get piece name
+
+                                # Determine color for bounding box
+                                color = (255, 0, 0) if class_name.isupper() else (0, 0, 255)  # White = Blue, Black = Red
+                                cv2.rectangle(img, (x1, y1), (x2, y2), color, 2)
+
+                                # Label the piece with confidence
+                                label = f"{class_name} {conf:.2f}"
+                                cv2.putText(img, label, (x1, y1 - 5),
+                                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+
+                        # Simulate FEN detection (Replace with actual FEN extraction logic)
+                        fen = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"
+                        print(f"FEN: {fen}")
+
+                        # Fetch move suggestion
+                        current_time = time.time()
+                        if current_time - self.last_api_call > COOLDOWN_DELAY:
+                            self.last_api_call = current_time
+                            self.current_move = self.get_optimal_move(fen)
+                            print(f"Suggested move: {self.current_move}")
+
+                if self.current_move:
+                    move_text = f"Suggested Move: {self.current_move}"
+                    cv2.putText(img, move_text, (10, 60),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+
+                cv2.imshow("Chess Detection", img)
+
+                key = cv2.waitKey(1) & 0xFF
+                if key == ord('d'):
+                    self.detect_now = True
+                elif key == ord('q'):
                     break
 
         finally:
